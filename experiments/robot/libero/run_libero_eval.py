@@ -127,6 +127,7 @@ class GenerateConfig:
     save_version: str = "vla-adapter"                # version of 
     use_pro_version: bool = True                     # encourage to use the pro models we released.
     phase: str = "Inference"
+    limit_tasks: int = -1                            # 只跑前 N 个任务（-1 = 全部任务）
 
 
 
@@ -262,7 +263,7 @@ def prepare_observation(obs, resize_size):
         ),
     }
 
-    return observation, img  # Return both processed observation and original image for replay
+    return observation, img, wrist_img  # Return processed observation + both raw images for replay
 
 
 
@@ -326,8 +327,9 @@ def run_episode(
                 continue
 
             # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
-            replay_images.append(img)
+            observation, img, wrist_img = prepare_observation(obs, resize_size)
+            # 横向拼接 agentview + 腕部相机，生成双视角帧
+            replay_images.append(np.hstack([img, wrist_img]))
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
@@ -507,7 +509,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    run_tasks = num_tasks if cfg.limit_tasks <= 0 else min(cfg.limit_tasks, num_tasks)
+    for task_id in tqdm.tqdm(range(run_tasks)):
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,

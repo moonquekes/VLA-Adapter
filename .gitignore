@@ -147,7 +147,15 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+tmp/
 
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+outputs/
+experiments/logs/
+pretrained_models/*/.cache/
+pretrained_models/*/wandb/
+pretrained_models/*/checkpoints/
+pretrained_models/*/run-metrics.jsonl
+pretrained_models/*/*+stage-*.jsonl
