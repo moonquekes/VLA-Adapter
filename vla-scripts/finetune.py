@@ -27,6 +27,9 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import wandb
 
+# Keep TensorFlow's C++ warnings out of the training logs.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
@@ -89,20 +92,22 @@ class FinetuneConfig:
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
-    lr_warmup_steps: int = 0.1                       # Number of steps to warm up learning rate (from 10% to 100%)
+    lr_warmup_steps: int = 0                         # Number of warmup optimizer steps (0 disables warmup)
     num_steps_before_decay: int = 100000             # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200000                          # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
-    save_freq: int = 10_000                          # Checkpoint saving frequency in steps
+    save_freq: int = 2000                            # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
+    curr_action_loss_weight: float = 1.0             # Weight for current action loss term
+    next_actions_loss_weight: float = 0.25           # Weight for future actions loss term
 
     # LoRA
     use_lora: bool = False                           # If True, uses LoRA fine-tuning
@@ -412,10 +417,23 @@ def run_forward_pass(
             multi_layer_hidden_states,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
-            phase=cfg.phase,
+            phase=cfg.phase if cfg is not None else "Training",
             )
 
-        loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
+        ground_truth_curr_action = ground_truth_actions[:, 0]
+        predicted_curr_action = predicted_actions[:, 0]
+        curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
+
+        if ground_truth_actions.shape[1] > 1:
+            ground_truth_next_actions = ground_truth_actions[:, 1:]
+            predicted_next_actions = predicted_actions[:, 1:]
+            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+        else:
+            next_actions_l1_loss = torch.zeros_like(curr_action_l1_loss)
+
+        curr_weight = cfg.curr_action_loss_weight if cfg is not None else 1.0
+        next_weight = cfg.next_actions_loss_weight if cfg is not None else 0.25
+        loss = curr_weight * curr_action_l1_loss + next_weight * next_actions_l1_loss
 
         metrics.update(
             {
@@ -426,12 +444,6 @@ def run_forward_pass(
         # Get detailed L1 losses for logging
         should_log_l1_loss = use_l1_regression
         if should_log_l1_loss:
-            ground_truth_curr_action = ground_truth_actions[:, 0]
-            predicted_curr_action = predicted_actions[:, 0]
-            ground_truth_next_actions = ground_truth_actions[:, 1:]
-            predicted_next_actions = predicted_actions[:, 1:]
-            curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
             if compute_diffusion_l1:
                 print('curr: ',curr_action_l1_loss.item())
                 # print('next: ',next_actions_l1_loss.item())
@@ -772,7 +784,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load processor and VLA
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-    processor = AutoProcessor.from_pretrained(cfg.config_file_path, trust_remote_code=True)
+    processor = PrismaticProcessor.from_pretrained(cfg.config_file_path, trust_remote_code=True)
 
     if cfg.use_minivlm:
         hf_token = ''
@@ -837,7 +849,14 @@ def finetune(cfg: FinetuneConfig) -> None:
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume:
+            adapter_dir = os.path.join(cfg.resum_vla_path, "lora_adapter")
+            if not os.path.isdir(adapter_dir):
+                raise FileNotFoundError(f"Expected LoRA adapter directory at: {adapter_dir}")
+            print(f"Loading LoRA adapter from: {adapter_dir}")
+            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
+        else:
+            vla = get_peft_model(vla, lora_config)
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
@@ -1013,7 +1032,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     }
 
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not distributed_state.is_main_process) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1074,15 +1093,26 @@ def finetune(cfg: FinetuneConfig) -> None:
                     step=log_step,
                 )
 
+            # Only treat the end of an accumulation window as a true training step.
+            did_finish_accumulation = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+
             # Optimizer and LR scheduler step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if did_finish_accumulation:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                progress.update()
+                if distributed_state.is_main_process:
+                    progress.update()
+                    progress.set_postfix(
+                        step=log_step,
+                        loss=f"{smoothened_metrics.get('loss_value', float('nan')):.4f}",
+                        curr_l1=f"{smoothened_metrics.get('curr_action_l1_loss', float('nan')):.4f}",
+                        next_l1=f"{smoothened_metrics.get('next_actions_l1_loss', float('nan')):.4f}",
+                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    )
 
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            # Save model checkpoint only once per completed optimizer step.
+            if did_finish_accumulation and gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1097,8 +1127,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     new_state_dict=RAW_STATE_DICT,
                 )
 
-            # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+            # Test model on validation set only once per completed optimizer step.
+            if did_finish_accumulation and cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
                 run_validation(
                     vla=vla,
                     action_head=action_head,

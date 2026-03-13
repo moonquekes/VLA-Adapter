@@ -4,6 +4,7 @@ Important constants for VLA training and evaluation.
 Attempts to automatically identify the correct constants to set based on the Python command used to launch
 training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
 """
+import os
 import sys
 from enum import Enum
 
@@ -71,8 +72,18 @@ def detect_robot_platform():
         return "LIBERO"
 
 
+def _get_env_int(name: str):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"Environment variable {name} must be a positive integer, got {value!r}")
+    return parsed
+
+
 # Determine which robot platform to use
-ROBOT_PLATFORM = detect_robot_platform()
+ROBOT_PLATFORM = os.getenv("VLA_ROBOT_PLATFORM_OVERRIDE", detect_robot_platform()).upper()
 
 # Set the appropriate constants based on the detected platform
 if ROBOT_PLATFORM == "LIBERO":
@@ -83,9 +94,11 @@ elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
 elif ROBOT_PLATFORM == "CALVIN":
     constants = CALVIN_CONSTANTS
+else:
+    raise ValueError(f"Unsupported robot platform override: {ROBOT_PLATFORM!r}")
 
 # Assign constants to global variables
-NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
+NUM_ACTIONS_CHUNK = _get_env_int("VLA_NUM_ACTIONS_CHUNK_OVERRIDE") or constants["NUM_ACTIONS_CHUNK"]
 ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
@@ -96,4 +109,6 @@ print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
 print(f"  ACTION_DIM = {ACTION_DIM}")
 print(f"  PROPRIO_DIM = {PROPRIO_DIM}")
 print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
+if os.getenv("VLA_NUM_ACTIONS_CHUNK_OVERRIDE"):
+    print("  NUM_ACTIONS_CHUNK source = VLA_NUM_ACTIONS_CHUNK_OVERRIDE")
 print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")

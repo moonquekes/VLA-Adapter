@@ -71,20 +71,25 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         print(f"Warning: No config.json found at {config_path}")
         return
 
-    # Create timestamped backup
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    desired_auto_map = {
+        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
+        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+    }
+
+    if config.get("auto_map") == desired_auto_map:
+        return
+
+    # Create timestamped backup only when we are about to modify the config.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
     shutil.copy2(config_path, backup_path)
     print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
 
     # Read and update the config
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    config["auto_map"] = {
-        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
-        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
-    }
+    config["auto_map"] = desired_auto_map
 
     # Write back the updated config
     with open(config_path, "w") as f:

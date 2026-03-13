@@ -185,6 +185,9 @@ def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     # with the suffix "_no_noops" in the dataset name)
     if unnorm_key not in model.norm_stats and f"{unnorm_key}_no_noops" in model.norm_stats:
         unnorm_key = f"{unnorm_key}_no_noops"
+    elif unnorm_key not in model.norm_stats and len(model.norm_stats) == 1:
+        # Custom single-dataset checkpoints may store only one normalization key.
+        unnorm_key = next(iter(model.norm_stats))
 
     assert unnorm_key in model.norm_stats, f"Action un-norm key {unnorm_key} not found in VLA `norm_stats`!"
 

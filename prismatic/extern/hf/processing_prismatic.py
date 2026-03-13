@@ -175,7 +175,7 @@ class PrismaticImageProcessor(ImageProcessingMixin):
 class PrismaticProcessor(ProcessorMixin):
     attributes: ClassVar[List[str]] = ["image_processor", "tokenizer"]
     image_processor_class: str = "AutoImageProcessor"
-    tokenizer_class: str = "AutoTokenizer"
+    tokenizer_class: str = "Qwen2TokenizerFast"
 
     def __init__(
         self,
