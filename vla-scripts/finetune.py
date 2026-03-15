@@ -5,8 +5,9 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 """
 
 import os
+import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
@@ -30,6 +31,11 @@ import wandb
 # Keep TensorFlow's C++ warnings out of the training logs.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
+# Ensure repo-root modules remain importable when this file is launched as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
@@ -47,6 +53,11 @@ from prismatic.training.train_utils import (
     compute_token_accuracy,
     get_current_action_mask,
     get_next_actions_mask
+)
+from prismatic.training.transition_metrics import (
+    compute_transition_metrics,
+    compute_transition_weighted_loss,
+    resolve_transition_loss_config,
 )
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -88,6 +99,12 @@ class FinetuneConfig:
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     phase1_path: str = "None"
+    enable_checkpoint_rollout_eval: bool = False
+    checkpoint_rollout_num_episodes: int = 10
+    checkpoint_rollout_task_suite: str = "libero_spatial"
+    checkpoint_rollout_task_id: int = 0
+    checkpoint_rollout_resolution: int = 256
+    checkpoint_rollout_num_steps_wait: int = 10
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -108,6 +125,13 @@ class FinetuneConfig:
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
     curr_action_loss_weight: float = 1.0             # Weight for current action loss term
     next_actions_loss_weight: float = 0.25           # Weight for future actions loss term
+    loss_type: str = "l1"                            # Elementwise regression loss in continuous-action mode
+    future_horizon_weights: str = "1.0,1.2,1.5,2.0,2.5,3.0,3.0"
+    transition_chunk_weight: float = 4.0
+    transition_step_radius: int = 1
+    transition_dim_weights: str = "1.25,1.25,2.5,1.0,1.0,1.0,4.0"
+    transition_gripper_threshold: float = 0.5
+    transition_weight_warmup_steps: int = 2000
 
     # LoRA
     use_lora: bool = False                           # If True, uses LoRA fine-tuning
@@ -303,7 +327,9 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     use_pro_version=True,
-    cfg=None
+    cfg=None,
+    transition_loss_config=None,
+    global_step: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -420,40 +446,40 @@ def run_forward_pass(
             phase=cfg.phase if cfg is not None else "Training",
             )
 
-        ground_truth_curr_action = ground_truth_actions[:, 0]
-        predicted_curr_action = predicted_actions[:, 0]
-        curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-
-        if ground_truth_actions.shape[1] > 1:
-            ground_truth_next_actions = ground_truth_actions[:, 1:]
-            predicted_next_actions = predicted_actions[:, 1:]
-            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-        else:
-            next_actions_l1_loss = torch.zeros_like(curr_action_l1_loss)
-
         curr_weight = cfg.curr_action_loss_weight if cfg is not None else 1.0
         next_weight = cfg.next_actions_loss_weight if cfg is not None else 0.25
-        loss = curr_weight * curr_action_l1_loss + next_weight * next_actions_l1_loss
+        if transition_loss_config is None:
+            raise ValueError("transition_loss_config is required when use_l1_regression=True")
+
+        loss, loss_details = compute_transition_weighted_loss(
+            predicted_actions=predicted_actions,
+            ground_truth_actions=ground_truth_actions,
+            config=transition_loss_config,
+            global_step=global_step,
+            max_steps=cfg.max_steps if cfg is not None else 1,
+            curr_action_loss_weight=curr_weight,
+            future_action_loss_weight=next_weight,
+        )
+        transition_metrics = compute_transition_metrics(
+            predicted_actions=predicted_actions,
+            ground_truth_actions=ground_truth_actions,
+            loss_details=loss_details,
+            config=transition_loss_config,
+        )
 
         metrics.update(
             {
                 "loss_value": loss.item(),  # Detached value for logging
             }
         )
+        metrics.update(transition_metrics)
 
         # Get detailed L1 losses for logging
         should_log_l1_loss = use_l1_regression
         if should_log_l1_loss:
             if compute_diffusion_l1:
-                print('curr: ',curr_action_l1_loss.item())
-                # print('next: ',next_actions_l1_loss.item())
-
-            metrics.update(
-                {
-                    "curr_action_l1_loss": curr_action_l1_loss.item(),
-                    "next_actions_l1_loss": next_actions_l1_loss.item(),
-                }
-            )
+                print("curr_action_loss:", transition_metrics["curr_action_loss"])
+                print("future_action_loss:", transition_metrics["future_action_loss"])
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
@@ -472,8 +498,11 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
     """
     smoothened_metrics = {}
     for name, deque in metrics_deques.items():
-        if deque and len(deque) > 0:
-            smoothened_metrics[name] = sum(deque) / len(deque)
+        if not deque:
+            continue
+        finite_values = [value for value in deque if torch.isfinite(torch.tensor(value))]
+        if finite_values:
+            smoothened_metrics[name] = sum(finite_values) / len(finite_values)
     return smoothened_metrics
 
 
@@ -493,13 +522,16 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     """
     log_dict = {}
     for name, value in metrics.items():
+        if not torch.isfinite(torch.tensor(value)):
+            continue
         # Map loss_value to Loss for better readability in W&B
         if name == "loss_value":
             log_dict[f"{prefix}/Loss"] = value
         # Keep other metrics as is
         else:
             log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
-    wandb_entity.log(log_dict, step=step)
+    if log_dict:
+        wandb_entity.log(log_dict, step=step)
 
 
 
@@ -516,7 +548,7 @@ def save_training_checkpoint(
     distributed_state,
     new_state_dict,
     
-) -> None:
+) -> Path:
     """
     Save all training checkpoints including model components, LoRA adapter, and dataset statistics.
 
@@ -612,6 +644,220 @@ def save_training_checkpoint(
         # Wait for merged model to be saved
         dist.barrier()
 
+    return checkpoint_dir
+
+
+def _is_better_rollout_summary(candidate_summary: dict, best_summary: Optional[dict]) -> bool:
+    """Return True if the candidate checkpoint should become the rollout-selected best checkpoint."""
+    if candidate_summary.get("status") != "ok":
+        return False
+
+    if best_summary is None:
+        return True
+    if best_summary.get("status") != "ok":
+        return True
+
+    candidate_success = candidate_summary["successes"]
+    best_success = best_summary["successes"]
+    if candidate_success != best_success:
+        return candidate_success > best_success
+
+    candidate_gripper_mae = candidate_summary["selection_transition_future_gripper_mae"]
+    best_gripper_mae = best_summary["selection_transition_future_gripper_mae"]
+    candidate_gripper_finite = torch.isfinite(torch.tensor(candidate_gripper_mae)).item()
+    best_gripper_finite = torch.isfinite(torch.tensor(best_gripper_mae)).item()
+    if candidate_gripper_finite != best_gripper_finite:
+        return candidate_gripper_finite
+    if candidate_gripper_finite and candidate_gripper_mae != best_gripper_mae:
+        return candidate_gripper_mae < best_gripper_mae
+
+    candidate_z_mae = candidate_summary["selection_transition_future_z_mae"]
+    best_z_mae = best_summary["selection_transition_future_z_mae"]
+    candidate_z_finite = torch.isfinite(torch.tensor(candidate_z_mae)).item()
+    best_z_finite = torch.isfinite(torch.tensor(best_z_mae)).item()
+    if candidate_z_finite != best_z_finite:
+        return candidate_z_finite
+    if candidate_z_finite and candidate_z_mae != best_z_mae:
+        return candidate_z_mae < best_z_mae
+
+    return False
+
+
+def build_rollout_eval_context(cfg, distributed_state):
+    """Create a fixed rollout-eval context for suction checkpoints on the main process."""
+    if not cfg.enable_checkpoint_rollout_eval or not distributed_state.is_main_process:
+        return None
+
+    from libero.libero import benchmark, get_libero_path
+    from run_suction_eval import TASK_MAX_STEPS, make_suction_env
+
+    task_suite_name = cfg.checkpoint_rollout_task_suite
+    bm_dict = benchmark.get_benchmark_dict()
+    if task_suite_name not in bm_dict:
+        raise ValueError(f"Unsupported checkpoint_rollout_task_suite: {task_suite_name}")
+
+    task_suite = bm_dict[task_suite_name]()
+    task = task_suite.get_task(cfg.checkpoint_rollout_task_id)
+    task_desc = task.language
+    bddl_file = os.path.join(
+        get_libero_path("bddl_files"),
+        task.problem_folder,
+        task.bddl_file,
+    )
+    initial_states = task_suite.get_task_init_states(cfg.checkpoint_rollout_task_id)
+    selected_initial_states = [
+        initial_states[idx % len(initial_states)]
+        for idx in range(cfg.checkpoint_rollout_num_episodes)
+    ]
+
+    return {
+        "task_desc": task_desc,
+        "max_steps": TASK_MAX_STEPS[task_suite_name],
+        "initial_states": selected_initial_states,
+        "bddl_file": bddl_file,
+        "resolution": cfg.checkpoint_rollout_resolution,
+        "env": None,
+    }
+
+
+def run_checkpoint_rollout_eval(
+    cfg,
+    checkpoint_dir: Path,
+    rollout_eval_context,
+    vla,
+    processor,
+    action_head,
+    proprio_projector,
+    selection_metrics: dict[str, float],
+    log_step: int,
+) -> dict:
+    """Run a fixed rollout suite on the current checkpoint and write a selection summary."""
+    from run_suction_eval import make_suction_env, run_episode
+
+    def write_summary(summary: dict) -> dict:
+        summary_path = checkpoint_dir / "rollout_eval_summary.json"
+        with open(summary_path, "w") as summary_file:
+            json.dump(summary, summary_file, indent=2)
+        return summary
+
+    eval_cfg = type("SuctionRolloutCfg", (), {})()
+    eval_cfg.model_family = "openvla"
+    eval_cfg.use_l1_regression = cfg.use_l1_regression
+    eval_cfg.use_minivlm = cfg.use_minivlm
+    eval_cfg.num_diffusion_steps = cfg.num_diffusion_steps
+    eval_cfg.use_film = cfg.use_film
+    eval_cfg.num_images_in_input = cfg.num_images_in_input
+    eval_cfg.use_proprio = cfg.use_proprio
+    eval_cfg.center_crop = True
+    eval_cfg.num_open_loop_steps = NUM_ACTIONS_CHUNK
+    eval_cfg.load_in_8bit = False
+    eval_cfg.load_in_4bit = False
+    eval_cfg.task_suite_name = cfg.checkpoint_rollout_task_suite
+    eval_cfg.use_pro_version = cfg.use_pro_version
+    eval_cfg.save_version = "suction"
+    eval_cfg.phase = "Inference"
+
+    model = vla.module if hasattr(vla, "module") else vla
+    if hasattr(model, "set_version"):
+        model.set_version(eval_cfg.save_version)
+    if cfg.dataset_name in model.norm_stats:
+        eval_cfg.unnorm_key = cfg.dataset_name
+    elif len(model.norm_stats) == 1:
+        eval_cfg.unnorm_key = next(iter(model.norm_stats))
+    else:
+        raise KeyError(
+            f"Unable to resolve unnorm_key for checkpoint rollout eval; available keys: {list(model.norm_stats.keys())}"
+        )
+    curr_action_head = action_head.module if action_head is not None and hasattr(action_head, "module") else action_head
+    curr_proprio_projector = (
+        proprio_projector.module
+        if proprio_projector is not None and hasattr(proprio_projector, "module")
+        else proprio_projector
+    )
+    resize_size = model.config.image_sizes[0]
+
+    env = rollout_eval_context.get("env")
+    if env is None:
+        try:
+            env = make_suction_env(
+                rollout_eval_context["bddl_file"],
+                rollout_eval_context["resolution"],
+            )
+            rollout_eval_context["env"] = env
+        except Exception as exc:
+            rollout_eval_context["env"] = None
+            return write_summary(
+                {
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "log_step": log_step,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "successes": 0,
+                    "num_episodes": cfg.checkpoint_rollout_num_episodes,
+                    "success_rate": float("nan"),
+                    "selection_transition_future_gripper_mae": selection_metrics.get(
+                        "transition_future_gripper_mae", float("nan")
+                    ),
+                    "selection_transition_future_z_mae": selection_metrics.get(
+                        "transition_future_z_mae", float("nan")
+                    ),
+                }
+            )
+
+    successes = 0
+    try:
+        for initial_state in rollout_eval_context["initial_states"]:
+            success, _ = run_episode(
+                env=env,
+                task_desc=rollout_eval_context["task_desc"],
+                cfg=eval_cfg,
+                model=model,
+                resize_size=resize_size,
+                processor=processor,
+                action_head=curr_action_head,
+                proprio_projector=curr_proprio_projector,
+                initial_state=initial_state,
+                max_steps=rollout_eval_context["max_steps"],
+                num_steps_wait=cfg.checkpoint_rollout_num_steps_wait,
+                record_video=False,
+            )
+            successes += int(success)
+    except Exception as exc:
+        try:
+            env.close()
+        except Exception:
+            pass
+        rollout_eval_context["env"] = None
+        return write_summary(
+            {
+                "checkpoint_dir": str(checkpoint_dir),
+                "log_step": log_step,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "successes": 0,
+                "num_episodes": cfg.checkpoint_rollout_num_episodes,
+                "success_rate": float("nan"),
+                "selection_transition_future_gripper_mae": selection_metrics.get(
+                    "transition_future_gripper_mae", float("nan")
+                ),
+                "selection_transition_future_z_mae": selection_metrics.get(
+                    "transition_future_z_mae", float("nan")
+                ),
+            }
+        )
+
+    summary = {
+        "checkpoint_dir": str(checkpoint_dir),
+        "log_step": log_step,
+        "status": "ok",
+        "successes": successes,
+        "num_episodes": cfg.checkpoint_rollout_num_episodes,
+        "success_rate": successes / max(cfg.checkpoint_rollout_num_episodes, 1),
+        "selection_transition_future_gripper_mae": selection_metrics.get("transition_future_gripper_mae", float("nan")),
+        "selection_transition_future_z_mae": selection_metrics.get("transition_future_z_mae", float("nan")),
+    }
+    return write_summary(summary)
+
 
 
 def run_validation(
@@ -685,7 +931,11 @@ def run_validation(
     # Compute average validation metrics
     avg_val_metrics = {}
     for metric_name in all_val_metrics[0].keys():
-        values = [metrics[metric_name] for metrics in all_val_metrics if metric_name in metrics]
+        values = [
+            metrics[metric_name]
+            for metrics in all_val_metrics
+            if metric_name in metrics and torch.isfinite(torch.tensor(metrics[metric_name]))
+        ]
         if values:
             avg_val_metrics[metric_name] = sum(values) / len(values)
 
@@ -750,6 +1000,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
         f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
     )
+    transition_loss_config = resolve_transition_loss_config(cfg, ACTION_DIM, NUM_ACTIONS_CHUNK)
 
     # Two options:
     # (1) Base model is on Hugging Face Hub
@@ -999,6 +1250,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
+    vla.module.norm_stats = train_dataset.dataset_statistics
+    rollout_eval_context = build_rollout_eval_context(cfg, distributed_state)
+    best_rollout_summary_path = run_dir / "best_rollout_checkpoint.json"
+    best_rollout_summary = None
+    if distributed_state.is_main_process and best_rollout_summary_path.exists():
+        with open(best_rollout_summary_path, "r") as best_summary_file:
+            best_rollout_summary = json.load(best_summary_file)
 
     # Create collator and dataloader
     collator = PaddedCollatorForActionPrediction(
@@ -1023,19 +1281,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
-    recent_metrics = {
-        "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
-        "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
-        "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
-        "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
-        "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
-    }
+    metric_window_size = max(cfg.grad_accumulation_steps, cfg.wandb_log_freq)
+    recent_metrics = defaultdict(lambda: deque(maxlen=metric_window_size))
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not distributed_state.is_main_process) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+
             # Compute training metrics and loss
             compute_diffusion_l1 = (cfg.use_l1_regression and batch_idx % cfg.diffusion_sample_freq == 0) or (cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0)
             loss, metrics = run_forward_pass(
@@ -1052,6 +1308,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 use_pro_version=cfg.use_pro_version,
                 cfg=cfg,
+                transition_loss_config=transition_loss_config,
+                global_step=log_step,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1065,14 +1323,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
@@ -1088,7 +1342,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
                     {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        "VLA Train/Learning Rate": optimizer.param_groups[0]["lr"],
                     },
                     step=log_step,
                 )
@@ -1106,14 +1360,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                     progress.set_postfix(
                         step=log_step,
                         loss=f"{smoothened_metrics.get('loss_value', float('nan')):.4f}",
-                        curr_l1=f"{smoothened_metrics.get('curr_action_l1_loss', float('nan')):.4f}",
-                        next_l1=f"{smoothened_metrics.get('next_actions_l1_loss', float('nan')):.4f}",
-                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                        curr_mae=f"{smoothened_metrics.get('curr_action_mae', float('nan')):.4f}",
+                        future_mae=f"{smoothened_metrics.get('future_action_mae', float('nan')):.4f}",
+                        lr=f"{optimizer.param_groups[0]['lr']:.2e}",
                     )
 
             # Save model checkpoint only once per completed optimizer step.
             if did_finish_accumulation and gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
+                checkpoint_dir = save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
                     log_step=log_step,
@@ -1126,6 +1380,52 @@ def finetune(cfg: FinetuneConfig) -> None:
                     distributed_state=distributed_state,
                     new_state_dict=RAW_STATE_DICT,
                 )
+                dist.barrier()
+                if cfg.enable_checkpoint_rollout_eval and distributed_state.is_main_process:
+                    vla.eval()
+                    if action_head is not None:
+                        action_head.eval()
+                    if proprio_projector is not None:
+                        proprio_projector.eval()
+
+                    rollout_summary = run_checkpoint_rollout_eval(
+                        cfg=cfg,
+                        checkpoint_dir=checkpoint_dir,
+                        rollout_eval_context=rollout_eval_context,
+                        vla=vla,
+                        processor=processor,
+                        action_head=action_head if cfg.use_l1_regression else None,
+                        proprio_projector=proprio_projector if cfg.use_proprio else None,
+                        selection_metrics=smoothened_metrics,
+                        log_step=log_step,
+                    )
+                    if rollout_summary.get("status") != "ok":
+                        print(
+                            f"[rollout-select] Skipping checkpoint rollout selection at step {log_step}: "
+                            f"{rollout_summary.get('error', 'unknown error')}"
+                        )
+                    elif _is_better_rollout_summary(rollout_summary, best_rollout_summary):
+                        best_rollout_summary = rollout_summary
+                        with open(best_rollout_summary_path, "w") as best_summary_file:
+                            json.dump(best_rollout_summary, best_summary_file, indent=2)
+                        print(
+                            f"[rollout-select] New best checkpoint at step {log_step}: "
+                            f"{rollout_summary['successes']}/{rollout_summary['num_episodes']} successes"
+                        )
+
+                    wandb.log(
+                        {
+                            "Checkpoint Rollout/Success Rate": rollout_summary["success_rate"],
+                            "Checkpoint Rollout/Successes": rollout_summary["successes"],
+                        },
+                        step=log_step,
+                    )
+                    vla.train()
+                    if action_head is not None:
+                        action_head.train()
+                    if proprio_projector is not None:
+                        proprio_projector.train()
+                dist.barrier()
 
             # Test model on validation set only once per completed optimizer step.
             if did_finish_accumulation and cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
@@ -1150,6 +1450,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+
+    if rollout_eval_context is not None:
+        rollout_eval_context["env"].env.close()
 
 
 if __name__ == "__main__":
